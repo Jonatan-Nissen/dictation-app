@@ -1,2 +1,4 @@
 # dictation-app
 Script that allows me to dictate and transcribe into any input
+
+Run `python3 ~/Documents/GitHub/dictation-app/dictation.py` to start.
