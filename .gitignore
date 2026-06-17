@@ -1,3 +1,7 @@
 .env
+.DS_Store
 __pycache__/
 *.pyc
+dictation.log*
+launchd.out.log
+launchd.err.log

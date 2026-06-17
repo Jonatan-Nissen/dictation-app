@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jonatan.dictation</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/jonatanrolstednissen/Documents/GitHub/base/repos/dictation-app/dictation.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jonatanrolstednissen/Documents/GitHub/base/repos/dictation-app</string>
+
+    <!-- Start at login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash (non-zero exit), but stay quit after a clean Quit
+         (exit 0) or a benign single-instance-lock refusal (also exit 0). -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- GUI session priority — needed for a responsive menu-bar app. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/jonatanrolstednissen/Documents/GitHub/base/repos/dictation-app/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jonatanrolstednissen/Documents/GitHub/base/repos/dictation-app/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+    </dict>
+</dict>
+</plist>
