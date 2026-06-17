@@ -19,26 +19,36 @@ Quit from the menu-bar icon (**Quit Dictation**) or with `Ctrl+C`.
 
 ## Run always-on (recommended)
 
-Install as a per-user LaunchAgent — starts at login, restarts on crash,
-single instance:
-
 ```sh
 ./install-launchagent.sh
 ```
 
-The first time, macOS may require granting `/usr/bin/python3` permission under
-**System Settings → Privacy & Security**:
+This builds a small **`Dictation App.app`** bundle into `~/Applications` and
+installs a per-user LaunchAgent that starts it at login, restarts it on crash,
+and keeps a single instance. The bundle wraps `dictation.py` (a copy of the
+Python interpreter lives inside it) so macOS attributes permissions to a
+recognisable **"Dictation App"** rather than a generic "Python".
+
+### Permissions
+
+On first use macOS prompts for **Microphone** and **Automation** — allow both.
+The global hotkey additionally needs two grants that don't auto-prompt; add
+**Dictation App** under **System Settings → Privacy & Security**:
 
 - **Accessibility** — for the global hotkey and paste
 - **Input Monitoring** — for the global hotkey
 
-Then kickstart it: `launchctl kickstart -k gui/$(id -u)/com.jonatan.dictation`
+Then restart it: `launchctl kickstart -k gui/$(id -u)/com.jonatan.dictation`
 
-Uninstall:
+> Built into `~/Applications` on purpose: `~/Documents` is iCloud/file-provider
+> synced, and the sync attributes break code-signing.
+
+### Uninstall
 
 ```sh
 launchctl bootout gui/$(id -u)/com.jonatan.dictation
 rm ~/Library/LaunchAgents/com.jonatan.dictation.plist
+rm -rf ~/Applications/DictationApp.app
 ```
 
 ## Robustness notes

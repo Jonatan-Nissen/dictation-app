@@ -10,6 +10,9 @@ DOMAIN="gui/$(id -u)"
 
 echo "Installing ${LABEL} LaunchAgent…"
 
+# Build (or rebuild) the .app bundle the agent launches.
+"$(dirname "$0")/make-app.sh"
+
 # Stop any running instance (managed or manual) for a clean cutover.
 launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
 pkill -f "dictation-app/dictation.py" 2>/dev/null || true
@@ -27,8 +30,9 @@ launchctl print "${DOMAIN}/${LABEL}" | grep -E "state|pid|program =" || true
 
 cat <<'NOTE'
 
-If the menu-bar mic icon appears but the Cmd+Shift+D hotkey does nothing,
-grant /usr/bin/python3 permission in System Settings → Privacy & Security:
+macOS should prompt for Microphone and Automation on first use. If the
+Cmd+Shift+D hotkey does nothing, also grant "Dictation App" in
+System Settings → Privacy & Security:
   • Accessibility        (for the global hotkey + paste)
   • Input Monitoring     (for the global hotkey)
 Then run:  launchctl kickstart -k gui/$(id -u)/com.jonatan.dictation
@@ -36,4 +40,5 @@ Then run:  launchctl kickstart -k gui/$(id -u)/com.jonatan.dictation
 To stop/uninstall:
   launchctl bootout gui/$(id -u)/com.jonatan.dictation
   rm ~/Library/LaunchAgents/com.jonatan.dictation.plist
+  rm -rf ~/Applications/DictationApp.app
 NOTE

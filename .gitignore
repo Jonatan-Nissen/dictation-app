@@ -5,3 +5,5 @@ __pycache__/
 dictation.log*
 launchd.out.log
 launchd.err.log
+DictationApp.app/
+# The .app bundle is built into ~/Applications (outside the repo) by make-app.sh.

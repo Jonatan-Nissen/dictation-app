@@ -5,10 +5,11 @@
     <key>Label</key>
     <string>com.jonatan.dictation</string>
 
+    <!-- Launch the .app bundle's executable so the process runs under the
+         "Dictation App" identity (recognisable name + permission prompts). -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/jonatanrolstednissen/Documents/GitHub/base/repos/dictation-app/dictation.py</string>
+        <string>/Users/jonatanrolstednissen/Applications/DictationApp.app/Contents/MacOS/DictationApp</string>
     </array>
 
     <key>WorkingDirectory</key>
