@@ -222,17 +222,8 @@ def transcribe(audio: np.ndarray) -> str:
     return result.strip() if isinstance(result, str) else result.text.strip()
 
 # ---------------------------------------------------------------------------
-# Text injection (clipboard + Cmd+V via osascript, then restore)
+# Text injection (clipboard + Cmd+V via osascript)
 # ---------------------------------------------------------------------------
-
-def _get_clipboard() -> str:
-    """Read current clipboard contents (plain text)."""
-    try:
-        r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2)
-        return r.stdout
-    except Exception:
-        return ""
-
 
 def _set_clipboard(text: str) -> None:
     """Write text to the clipboard."""
@@ -245,14 +236,17 @@ def _set_clipboard(text: str) -> None:
 
 
 def inject_text(text: str) -> None:
-    """Paste text into the currently focused input, then restore clipboard.
+    """Put the transcription on the clipboard and paste it into the focused input.
+
+    The text is intentionally LEFT on the clipboard afterwards (the original is
+    NOT restored) so every dictation lands in clipboard history — e.g. JumpCut —
+    and can be re-pasted if the paste missed the intended field. Running as an
+    app there's no terminal scrollback to recover it from otherwise.
 
     Uses osascript to send Cmd+V rather than pynput's Controller: injecting
     synthetic key events through pynput while its GlobalHotKeys listener is
     running can desync the listener and silently break the hotkey.
     """
-    original_clipboard = _get_clipboard()
-
     _set_clipboard(text)
     time.sleep(0.05)  # let pasteboard propagate
 
@@ -264,9 +258,7 @@ def inject_text(text: str) -> None:
     )
 
     time.sleep(0.25)  # wait for paste to complete
-
-    # Restore original clipboard
-    _set_clipboard(original_clipboard)
+    # Leave `text` on the clipboard so it stays in clipboard history.
 
 # ---------------------------------------------------------------------------
 # Toggle handler (runs transcription in a thread)
