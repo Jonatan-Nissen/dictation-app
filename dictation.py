@@ -292,8 +292,8 @@ def _process_recording() -> None:
         notify("Dictation", f"❌ Transcription error: {e}")
 
 
-def on_toggle() -> None:
-    """Hotkey handler. Crash-guarded so a device error never kills the listener."""
+def _handle_toggle() -> None:
+    """Start/stop recording. Runs on a worker thread (see on_toggle)."""
     global is_recording
     with lock:
         try:
@@ -310,6 +310,17 @@ def on_toggle() -> None:
             is_recording = False
             _cleanup_stream()
             notify("Dictation", f"⚠️ Error: {e}")
+
+
+def on_toggle() -> None:
+    """Hotkey callback — runs inside the macOS event-tap, so it MUST return fast.
+
+    Starting a recording sleeps ~0.8s and opens an audio device; doing that
+    here would block the event tap long enough for macOS to disable it
+    (kCGEventTapDisabledByTimeout), silently killing the hotkey until restart.
+    Hand the slow work to a worker thread and return immediately.
+    """
+    threading.Thread(target=_handle_toggle, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Hotkey listener (runs in a background thread under the Cocoa app)
