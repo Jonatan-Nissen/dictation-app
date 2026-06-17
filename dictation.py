@@ -114,6 +114,7 @@ def acquire_single_instance_lock() -> bool:
 # ---------------------------------------------------------------------------
 
 is_recording = False
+capturing = False        # True once audio actually starts flowing — drives the icon
 audio_chunks = []
 stream = None
 lock = threading.Lock()
@@ -156,14 +157,22 @@ def notify(title: str, message: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _audio_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
+    global capturing
     if status:
         log.warning("sounddevice status: %s", status)
+    if not capturing:
+        # First buffer has arrived — the mic is genuinely capturing now. The
+        # icon turns red off this, not off stream.start(), because the device
+        # (esp. Bluetooth) can warm up for a beat after start() returns.
+        capturing = True
+        log.info("audio capture confirmed")
     audio_chunks.append(indata.copy())
 
 
 def _cleanup_stream() -> None:
     """Stop and close the input stream, ignoring errors. Safe to call anytime."""
-    global stream
+    global stream, capturing
+    capturing = False
     if stream is not None:
         try:
             stream.stop()
@@ -176,10 +185,11 @@ def _cleanup_stream() -> None:
 
 def start_recording() -> None:
     """Open the mic and begin capturing. Raises if the device can't be opened."""
-    global stream, audio_chunks
+    global stream, audio_chunks, capturing
     audio_chunks = []
+    capturing = False
     play_sound("Bottle")
-    notify("Dictation", "🎙 Recording… press Cmd+Shift+D to stop")
+    notify("Dictation", "🎙 Starting… wait for the red icon")
     log.info("recording started")
     # Delay so the sound finishes before the audio input stream takes over
     time.sleep(0.8)
@@ -382,15 +392,16 @@ class DictationStatusDelegate(NSObject):
             # Poll shared state on the main thread (AppKit is not thread-safe,
             # so the hotkey thread must not touch the status item directly).
             self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                0.3, self, b"tick:", None, True
+                0.1, self, b"tick:", None, True
             )
             log.info("menu-bar item ready")
         except Exception:
             log.exception("failed to build menu-bar item (hotkey still active)")
 
     def tick_(self, _timer) -> None:
-        if is_recording != self._shown:
-            self.render_(is_recording)
+        # Red reflects real audio capture, not just that recording was toggled.
+        if capturing != self._shown:
+            self.render_(capturing)
 
     def render_(self, recording: bool) -> None:
         self._shown = recording
