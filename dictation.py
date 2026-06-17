@@ -69,6 +69,14 @@ REC_SYMBOL = "mic.fill"
 IDLE_EMOJI = "🎙"
 REC_EMOJI = "🔴"
 
+# Mic warm-up: built-in / wired mics capture instantly, but a Bluetooth mic
+# (AirPods) must switch into call/HFP mode first — ~1-2s during which the stream
+# delivers warm-up silence. For Bluetooth we hold the icon non-red and discard
+# audio until real signal is flowing, so the red icon always means "I hear you".
+WARMUP_RMS_THRESHOLD = 15.0   # int16 RMS above this = mic delivering real audio
+WARMUP_MIN_SECONDS = 0.3      # ignore the very first instant of a BT stream
+WARMUP_MAX_SECONDS = 4.0      # declare live anyway after this, so it never hangs
+
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "dictation.lock")
 LOG_PATH = os.path.join(APP_DIR, "dictation.log")
 
@@ -114,7 +122,9 @@ def acquire_single_instance_lock() -> bool:
 # ---------------------------------------------------------------------------
 
 is_recording = False
-capturing = False        # True once audio actually starts flowing — drives the icon
+capturing = False         # True once the mic is live & we're keeping audio — drives the icon
+_wait_for_warmup = False  # True while discarding a Bluetooth mic's warm-up silence
+_warmup_start = 0.0       # monotonic time the stream started (for warm-up timeout)
 audio_chunks = []
 stream = None
 lock = threading.Lock()
@@ -156,23 +166,37 @@ def notify(title: str, message: str) -> None:
 # Recording
 # ---------------------------------------------------------------------------
 
+def _input_is_bluetooth(name: str) -> bool:
+    """Heuristic: does this input device need a Bluetooth mic-mode handover?"""
+    n = name.lower()
+    return any(k in n for k in
+               ("airpods", "bluetooth", "beats", "buds", "headset", "wireless"))
+
+
 def _audio_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-    global capturing
+    global capturing, _wait_for_warmup
     if status:
         log.warning("sounddevice status: %s", status)
     if not capturing:
-        # First buffer has arrived — the mic is genuinely capturing now. The
-        # icon turns red off this, not off stream.start(), because the device
-        # (esp. Bluetooth) can warm up for a beat after start() returns.
-        capturing = True
-        log.info("audio capture confirmed")
+        if _wait_for_warmup:
+            # Bluetooth mic: discard the warm-up (silence) until real signal
+            # flows, so we don't go red — or clip words — before the mic is live.
+            elapsed = time.monotonic() - _warmup_start
+            rms = float(np.sqrt(np.mean(np.square(indata.astype(np.float32)))))
+            live = elapsed >= WARMUP_MIN_SECONDS and rms >= WARMUP_RMS_THRESHOLD
+            if not live and elapsed < WARMUP_MAX_SECONDS:
+                return  # still warming up — drop this buffer
+            log.info("mic live after %.2fs (rms=%.0f)", elapsed, rms)
+            _wait_for_warmup = False
+        capturing = True  # drives the red icon
     audio_chunks.append(indata.copy())
 
 
 def _cleanup_stream() -> None:
     """Stop and close the input stream, ignoring errors. Safe to call anytime."""
-    global stream, capturing
+    global stream, capturing, _wait_for_warmup
     capturing = False
+    _wait_for_warmup = False
     if stream is not None:
         try:
             stream.stop()
@@ -185,14 +209,21 @@ def _cleanup_stream() -> None:
 
 def start_recording() -> None:
     """Open the mic and begin capturing. Raises if the device can't be opened."""
-    global stream, audio_chunks, capturing
+    global stream, audio_chunks, capturing, _wait_for_warmup, _warmup_start
     audio_chunks = []
     capturing = False
+    try:
+        dev_name = sd.query_devices(kind="input").get("name", "?")
+    except Exception:
+        dev_name = "?"
+    _wait_for_warmup = _input_is_bluetooth(dev_name)
     play_sound("Bottle")
     notify("Dictation", "🎙 Starting… wait for the red icon")
-    log.info("recording started")
+    log.info("recording started (input=%s, %s)", dev_name,
+             "Bluetooth — waiting for mic to wake" if _wait_for_warmup else "wired/built-in")
     # Delay so the sound finishes before the audio input stream takes over
     time.sleep(0.8)
+    _warmup_start = time.monotonic()
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
