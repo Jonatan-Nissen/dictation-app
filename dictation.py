@@ -77,6 +77,14 @@ WARMUP_RMS_THRESHOLD = 15.0   # int16 RMS above this = mic delivering real audio
 WARMUP_MIN_SECONDS = 0.3      # ignore the very first instant of a BT stream
 WARMUP_MAX_SECONDS = 4.0      # declare live anyway after this, so it never hangs
 
+# Opening the input stream can fail with PortAudio's paInternalError (-9986) when
+# this long-running process holds a stale CoreAudio device handle — e.g. after
+# AirPods disconnect and reconnect, getting a new handle while our cached
+# "default input" points at the dead one. Tearing PortAudio down and back up
+# re-enumerates devices and clears the stale handle, so we retry across a reinit.
+STREAM_OPEN_ATTEMPTS = 3
+STREAM_OPEN_BACKOFF = 0.4     # seconds between attempts, after a PortAudio reinit
+
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "dictation.lock")
 LOG_PATH = os.path.join(APP_DIR, "dictation.log")
 
@@ -207,6 +215,42 @@ def _cleanup_stream() -> None:
             stream = None
 
 
+def _open_input_stream() -> "sd.InputStream":
+    """Open + start the default input stream, retrying across a PortAudio reinit.
+
+    Guards against the stale-device-handle failure (paInternalError / -9986) that
+    hits a long-lived process after a Bluetooth mic reconnects — see the
+    STREAM_OPEN_* constants. A fresh sd._terminate()/_initialize() re-enumerates
+    devices and resolves the current default afresh.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, STREAM_OPEN_ATTEMPTS + 1):
+        try:
+            s = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                callback=_audio_callback,
+            )
+            s.start()
+            if attempt > 1:
+                log.info("input stream opened on attempt %d after reinit", attempt)
+            return s
+        except sd.PortAudioError as e:
+            last_err = e
+            if attempt == STREAM_OPEN_ATTEMPTS:
+                break
+            log.warning("input open failed (attempt %d/%d): %s — reinitializing "
+                        "PortAudio and retrying", attempt, STREAM_OPEN_ATTEMPTS, e)
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as re:  # reinit is best-effort; still retry the open
+                log.warning("PortAudio reinit error: %s", re)
+            time.sleep(STREAM_OPEN_BACKOFF)
+    raise last_err
+
+
 def start_recording() -> None:
     """Open the mic and begin capturing. Raises if the device can't be opened."""
     global stream, audio_chunks, capturing, _wait_for_warmup, _warmup_start
@@ -224,13 +268,7 @@ def start_recording() -> None:
     # Delay so the sound finishes before the audio input stream takes over
     time.sleep(0.8)
     _warmup_start = time.monotonic()
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        callback=_audio_callback,
-    )
-    stream.start()
+    stream = _open_input_stream()
 
 
 def stop_recording() -> None:
