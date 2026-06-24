@@ -63,6 +63,11 @@ MODEL = "gpt-4o-mini-transcribe"
 HOTKEY = "<cmd>+<shift>+d"
 HOTKEY_DISPLAY = "⌘⇧D"
 
+# launchd LaunchAgent label — used by the menu's "Restart" item to kick the
+# service over (kill + relaunch a fresh process), the proven recovery for a
+# wedged hotkey listener or a stale CoreAudio handle.
+LAUNCHD_LABEL = "com.jonatan.dictation"
+
 # Menu-bar glyphs (SF Symbols, with emoji fallback if unavailable)
 IDLE_SYMBOL = "mic"
 REC_SYMBOL = "mic.fill"
@@ -451,9 +456,17 @@ class DictationStatusDelegate(NSObject):
                 info.setEnabled_(False)
                 menu.addItem_(info)
             menu.addItem_(NSMenuItem.separatorItem())
+            # No key equivalents on these items: a status-menu key equivalent
+            # only fires while the menu is open, but we keep them blank anyway so
+            # there's no chance of shadowing ⌘R/⌘Q that Jonatan uses elsewhere.
+            restart_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Restart Dictation", "restart:", ""
+            )
+            restart_item.setTarget_(self)  # action lives on this delegate, not NSApp
+            menu.addItem_(restart_item)
             menu.addItem_(
                 NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    "Quit Dictation", "terminate:", "q"
+                    "Quit Dictation", "terminate:", ""
                 )
             )
             self.item.setMenu_(menu)
@@ -466,6 +479,29 @@ class DictationStatusDelegate(NSObject):
             log.info("menu-bar item ready")
         except Exception:
             log.exception("failed to build menu-bar item (hotkey still active)")
+
+    def restart_(self, _sender) -> None:
+        """Menu action: kill + relaunch via launchd, the fix for a stuck app.
+
+        We don't restart in-process: when the hotkey listener is wedged or a
+        CoreAudio handle has gone stale, only a genuinely fresh process clears
+        it. `launchctl kickstart -k` SIGTERMs this instance and relaunches it
+        regardless of the KeepAlive=SuccessfulExit:false policy. The kickstart
+        is spawned in its own session (start_new_session) so it outlives the
+        SIGTERM it's about to deliver to us.
+        """
+        log.info("restart requested from menu — kickstarting %s", LAUNCHD_LABEL)
+        target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+        try:
+            subprocess.Popen(
+                ["launchctl", "kickstart", "-k", target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            log.exception("failed to spawn launchctl kickstart")
+            notify("Dictation", "⚠️ Restart failed — see dictation.log")
 
     def tick_(self, _timer) -> None:
         # Red reflects real audio capture, not just that recording was toggled.
