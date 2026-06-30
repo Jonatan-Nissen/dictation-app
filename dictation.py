@@ -478,7 +478,16 @@ class DictationStatusDelegate(NSObject):
             )
             log.info("menu-bar item ready")
         except Exception:
-            log.exception("failed to build menu-bar item (hotkey still active)")
+            # Soldiering on without a status item leaves an invisible process:
+            # the hotkey still fires, but there's no icon and no way to Quit or
+            # Restart from the UI — a zombie you can only kill from a terminal.
+            # Exit non-zero so launchd's KeepAlive=SuccessfulExit:false relaunches
+            # a fresh copy in a clean GUI session; launchd's 10s throttle keeps a
+            # persistent failure from hot-looping. os._exit because a raise here
+            # is swallowed by the Cocoa run loop.
+            log.exception("failed to build menu-bar item — exiting for a clean relaunch")
+            notify("Dictation", "⚠️ Menu-bar icon failed to load — relaunching.")
+            os._exit(1)
 
     def restart_(self, _sender) -> None:
         """Menu action: kill + relaunch via launchd, the fix for a stuck app.
@@ -532,10 +541,14 @@ def main() -> None:
     if not acquire_single_instance_lock():
         # A duplicate launch is benign (e.g. launchd plus a manual start).
         # Exit 0 so launchd's KeepAlive does not treat it as a crash and loop.
+        # But say so: a silent exit is indistinguishable from "the app won't
+        # open" when you double-click it from /Applications while launchd
+        # already has it running — which is exactly how it reads to the user.
         log.warning(
             "Another dictation instance already holds the lock (%s). Exiting.",
             LOCK_PATH,
         )
+        notify("Dictation", f"Already running — {HOTKEY_DISPLAY} works. Check the menu bar.")
         sys.exit(0)
 
     log.info("=" * 50)
