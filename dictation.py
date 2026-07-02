@@ -90,6 +90,16 @@ WARMUP_MAX_SECONDS = 4.0      # declare live anyway after this, so it never hang
 STREAM_OPEN_ATTEMPTS = 3
 STREAM_OPEN_BACKOFF = 0.4     # seconds between attempts, after a PortAudio reinit
 
+# stream.stop()/close() call into CoreAudio, which can hang *indefinitely* on a
+# wedged HAL mutex — not raising, just blocking forever in __psynch_mutexwait.
+# Seen 2026-07-02 after coreaudiod had run 43 days: a stop() froze inside
+# HALB_Mutex::Lock and, because teardown runs while _handle_toggle holds `lock`,
+# wedged every subsequent hotkey press (white icon, no cue, no transcript). We
+# cap how long we'll wait for teardown and abandon it past that — see
+# _cleanup_stream. Distinct from the stale-*handle* open error above: that one
+# raises (and we retry); this one hangs (and we can't, so we walk away).
+STREAM_CLOSE_TIMEOUT = 3.0    # seconds to wait for stop()+close() before abandoning
+
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "dictation.lock")
 LOG_PATH = os.path.join(APP_DIR, "dictation.log")
 
@@ -206,18 +216,38 @@ def _audio_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
 
 
 def _cleanup_stream() -> None:
-    """Stop and close the input stream, ignoring errors. Safe to call anytime."""
+    """Stop and close the input stream, ignoring errors. Safe to call anytime.
+
+    The stop()/close() calls into CoreAudio can hang forever on a wedged HAL
+    mutex (see STREAM_CLOSE_TIMEOUT). This runs while _handle_toggle holds `lock`,
+    so a hang here would freeze the whole app. Do the teardown on a throwaway
+    daemon thread and give up on it past the timeout: we drop our reference and
+    let a fresh stream open next time. The orphaned thread stays stuck in C — a
+    daemon, so it can't block process exit — but the app stays responsive and the
+    current recording still gets transcribed (stop_recording continues past us).
+    Only a coreaudiod reset / reboot truly clears the underlying wedge.
+    """
     global stream, capturing, _wait_for_warmup
     capturing = False
     _wait_for_warmup = False
-    if stream is not None:
+    s, stream = stream, None
+    if s is None:
+        return
+
+    def _teardown() -> None:
         try:
-            stream.stop()
-            stream.close()
+            s.stop()
+            s.close()
         except Exception as e:
             log.warning("error closing stream: %s", e)
-        finally:
-            stream = None
+
+    t = threading.Thread(target=_teardown, daemon=True)
+    t.start()
+    t.join(STREAM_CLOSE_TIMEOUT)
+    if t.is_alive():
+        log.warning("stream teardown hung >%.0fs (CoreAudio wedged) — abandoning "
+                    "it; a fresh stream opens next recording, but the wedge itself "
+                    "clears only on a coreaudiod reset / reboot", STREAM_CLOSE_TIMEOUT)
 
 
 def _open_input_stream() -> "sd.InputStream":
