@@ -19,6 +19,7 @@ Designed to run always-on in the background:
 """
 
 import fcntl
+import json
 import logging
 import os
 import signal
@@ -40,6 +41,8 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSColor,
+    NSControlStateValueOff,
+    NSControlStateValueOn,
     NSImage,
     NSMenu,
     NSMenuItem,
@@ -103,6 +106,10 @@ STREAM_CLOSE_TIMEOUT = 3.0    # seconds to wait for stop()+close() before abando
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "dictation.lock")
 LOG_PATH = os.path.join(APP_DIR, "dictation.log")
 
+# User preferences (currently just the pinned input device). Kept next to the
+# app so a chosen mic survives restarts. Absent/empty = follow the system default.
+PREF_PATH = os.path.join(APP_DIR, "preferences.json")
+
 # ---------------------------------------------------------------------------
 # Logging — file (always-on diagnosis) + stderr (foreground use)
 # ---------------------------------------------------------------------------
@@ -151,6 +158,81 @@ _warmup_start = 0.0       # monotonic time the stream started (for warm-up timeo
 audio_chunks = []
 stream = None
 lock = threading.Lock()
+
+# Pinned input device, by NAME (None = follow the system default input). Stored by
+# name, not PortAudio index, because the index reshuffles as devices come and go —
+# a name is what stays stable across an AirPods reconnect. Read at recording start
+# on the worker thread, written from the menu on the main thread; a lone str/None
+# assignment is atomic under the GIL, so it needs no lock.
+preferred_input_name = None
+
+# ---------------------------------------------------------------------------
+# Preferences (pinned input device)
+# ---------------------------------------------------------------------------
+
+def _load_preferences() -> None:
+    """Load the pinned input device from disk, if any. Best-effort."""
+    global preferred_input_name
+    try:
+        with open(PREF_PATH) as f:
+            preferred_input_name = json.load(f).get("input_device") or None
+    except FileNotFoundError:
+        preferred_input_name = None
+    except Exception:
+        log.exception("could not read %s — following system default input", PREF_PATH)
+        preferred_input_name = None
+
+
+def _save_preferences() -> None:
+    """Persist the pinned input device so it survives a restart. Best-effort."""
+    try:
+        with open(PREF_PATH, "w") as f:
+            json.dump({"input_device": preferred_input_name}, f, indent=2)
+    except Exception:
+        log.exception("could not write %s", PREF_PATH)
+
+
+def _list_input_devices() -> list:
+    """Names of currently-available input devices, de-duplicated, in enumeration order."""
+    names = []
+    try:
+        for dev in sd.query_devices():
+            if dev.get("max_input_channels", 0) > 0:
+                name = dev.get("name", "")
+                if name and name not in names:
+                    names.append(name)
+    except Exception:
+        log.exception("could not enumerate input devices")
+    return names
+
+
+def _default_input_name() -> str:
+    """Name of whatever macOS currently considers the default input (for logging)."""
+    try:
+        return sd.query_devices(kind="input").get("name", "?")
+    except Exception:
+        return "?"
+
+
+def _resolve_input_device():
+    """Return (device selector, human name) for opening the input stream.
+
+    device selector is a PortAudio index when the user has pinned a specific mic,
+    or None to let sounddevice pick the current system default. If a pinned device
+    isn't present right now (e.g. the AirPods are disconnected), fall back to the
+    default so dictation never dead-ends on a missing mic.
+    """
+    if preferred_input_name:
+        try:
+            for idx, dev in enumerate(sd.query_devices()):
+                if (dev.get("max_input_channels", 0) > 0
+                        and dev.get("name") == preferred_input_name):
+                    return idx, preferred_input_name
+        except Exception:
+            log.exception("could not resolve pinned input device %r", preferred_input_name)
+        log.warning("pinned input device %r not available — falling back to system default",
+                    preferred_input_name)
+    return None, _default_input_name()
 
 # ---------------------------------------------------------------------------
 # Audio + visual feedback
@@ -251,25 +333,39 @@ def _cleanup_stream() -> None:
 
 
 def _open_input_stream() -> "sd.InputStream":
-    """Open + start the default input stream, retrying across a PortAudio reinit.
+    """Open + start the input stream, retrying across a PortAudio reinit.
 
-    Guards against the stale-device-handle failure (paInternalError / -9986) that
-    hits a long-lived process after a Bluetooth mic reconnects — see the
-    STREAM_OPEN_* constants. A fresh sd._terminate()/_initialize() re-enumerates
-    devices and resolves the current default afresh.
+    Uses the user's pinned device if set, else the system default (see
+    _resolve_input_device). Guards against the stale-device-handle failure
+    (paInternalError / -9986) that hits a long-lived process after a Bluetooth
+    mic reconnects — see the STREAM_OPEN_* constants. A fresh
+    sd._terminate()/_initialize() re-enumerates devices, so we re-resolve the
+    device on every attempt: after a reinit its PortAudio index can shift, and
+    a device that was absent may now be back (or vice versa).
+
+    Sets the warm-up state and stamps _warmup_start immediately before start(),
+    both keyed to the device actually opened, so a Bluetooth pin still discards
+    its wake-up silence.
     """
+    global _wait_for_warmup, _warmup_start
     last_err: Exception | None = None
     for attempt in range(1, STREAM_OPEN_ATTEMPTS + 1):
+        device, dev_name = _resolve_input_device()
+        _wait_for_warmup = _input_is_bluetooth(dev_name)
         try:
             s = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="int16",
+                device=device,
                 callback=_audio_callback,
             )
+            _warmup_start = time.monotonic()
             s.start()
-            if attempt > 1:
-                log.info("input stream opened on attempt %d after reinit", attempt)
+            log.info("recording started (input=%s, %s)%s", dev_name,
+                     "Bluetooth — waiting for mic to wake" if _wait_for_warmup
+                     else "wired/built-in",
+                     f" [attempt {attempt} after reinit]" if attempt > 1 else "")
             return s
         except sd.PortAudioError as e:
             last_err = e
@@ -288,21 +384,15 @@ def _open_input_stream() -> "sd.InputStream":
 
 def start_recording() -> None:
     """Open the mic and begin capturing. Raises if the device can't be opened."""
-    global stream, audio_chunks, capturing, _wait_for_warmup, _warmup_start
+    global stream, audio_chunks, capturing
     audio_chunks = []
     capturing = False
-    try:
-        dev_name = sd.query_devices(kind="input").get("name", "?")
-    except Exception:
-        dev_name = "?"
-    _wait_for_warmup = _input_is_bluetooth(dev_name)
     play_sound("Bottle")
     notify("Dictation", "🎙 Starting… wait for the red icon")
-    log.info("recording started (input=%s, %s)", dev_name,
-             "Bluetooth — waiting for mic to wake" if _wait_for_warmup else "wired/built-in")
-    # Delay so the sound finishes before the audio input stream takes over
+    # Delay so the sound finishes before the audio input stream takes over.
+    # _open_input_stream resolves the device, sets warm-up, and stamps the
+    # warm-up clock right before it starts the stream.
     time.sleep(0.8)
-    _warmup_start = time.monotonic()
     stream = _open_input_stream()
 
 
@@ -486,6 +576,21 @@ class DictationStatusDelegate(NSObject):
                 info.setEnabled_(False)
                 menu.addItem_(info)
             menu.addItem_(NSMenuItem.separatorItem())
+
+            # Input-device picker. The submenu is rebuilt every time it opens
+            # (see menuNeedsUpdate_) because the device list changes as mics come
+            # and go — building it once at launch would go stale the moment the
+            # AirPods connect. "System Default" is the checked entry unless a
+            # specific device has been pinned.
+            self.input_menu = NSMenu.alloc().init()
+            self.input_menu.setDelegate_(self)
+            input_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Input Device", None, ""
+            )
+            input_item.setSubmenu_(self.input_menu)
+            menu.addItem_(input_item)
+            menu.addItem_(NSMenuItem.separatorItem())
+
             # No key equivalents on these items: a status-menu key equivalent
             # only fires while the menu is open, but we keep them blank anyway so
             # there's no chance of shadowing ⌘R/⌘Q that Jonatan uses elsewhere.
@@ -518,6 +623,65 @@ class DictationStatusDelegate(NSObject):
             log.exception("failed to build menu-bar item — exiting for a clean relaunch")
             notify("Dictation", "⚠️ Menu-bar icon failed to load — relaunching.")
             os._exit(1)
+
+    def menuNeedsUpdate_(self, menu) -> None:
+        """Rebuild the input-device submenu just before it opens (NSMenuDelegate).
+
+        Re-enumerates devices each time so the list is always current, and puts
+        the checkmark on whatever is active — "System Default" when nothing is
+        pinned, otherwise the pinned device. A pinned device that's currently
+        absent still shows checked, so it's clear what the app will reconnect to.
+        """
+        if menu is not self.input_menu:
+            return
+        menu.removeAllItems()
+
+        default_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "System Default", "selectInputDevice:", ""
+        )
+        default_item.setTarget_(self)
+        default_item.setRepresentedObject_(None)  # None = follow the system default
+        default_item.setState_(
+            NSControlStateValueOff if preferred_input_name else NSControlStateValueOn
+        )
+        menu.addItem_(default_item)
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        available = _list_input_devices()
+        for name in available:
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                name, "selectInputDevice:", ""
+            )
+            it.setTarget_(self)
+            it.setRepresentedObject_(name)
+            it.setState_(
+                NSControlStateValueOn if name == preferred_input_name
+                else NSControlStateValueOff
+            )
+            menu.addItem_(it)
+
+        # A device can be pinned but not currently present (e.g. AirPods asleep).
+        # Show it, disabled, so the user sees the app is still waiting on it.
+        if preferred_input_name and preferred_input_name not in available:
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{preferred_input_name} (not connected)", "selectInputDevice:", ""
+            )
+            it.setTarget_(self)
+            it.setRepresentedObject_(preferred_input_name)
+            it.setState_(NSControlStateValueOn)
+            menu.addItem_(it)
+
+    def selectInputDevice_(self, sender) -> None:
+        """Menu action: pin an input device (or 'System Default' to unpin)."""
+        global preferred_input_name
+        preferred_input_name = sender.representedObject()  # None for System Default
+        _save_preferences()
+        if preferred_input_name:
+            log.info("input device pinned to %r", preferred_input_name)
+            notify("Dictation", f"🎙 Input: {preferred_input_name}")
+        else:
+            log.info("input device set to follow system default")
+            notify("Dictation", "🎙 Input: System Default")
 
     def restart_(self, _sender) -> None:
         """Menu action: kill + relaunch via launchd, the fix for a stuck app.
@@ -581,9 +745,12 @@ def main() -> None:
         notify("Dictation", f"Already running — {HOTKEY_DISPLAY} works. Check the menu bar.")
         sys.exit(0)
 
+    _load_preferences()
+
     log.info("=" * 50)
     log.info("Dictation Tool  |  hotkey %s  |  model %s  |  pid %d",
              HOTKEY, MODEL, os.getpid())
+    log.info("Input device: %s", preferred_input_name or "system default")
     log.info("Logging to %s", LOG_PATH)
     log.info("=" * 50)
 
