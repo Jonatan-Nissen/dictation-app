@@ -40,6 +40,11 @@
     <dict>
         <key>PATH</key>
         <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+        <!-- Marks this process as launchd-started (correct GUI session, icon
+             can draw). A double-click / manual run lacks it and hands off to
+             launchd instead of running headless. See dictation.py main(). -->
+        <key>DICTATION_VIA_LAUNCHD</key>
+        <string>1</string>
     </dict>
 </dict>
 </plist>

@@ -70,6 +70,14 @@ HOTKEY_DISPLAY = "⌘⇧D"
 # service over (kill + relaunch a fresh process), the proven recovery for a
 # wedged hotkey listener or a stale CoreAudio handle.
 LAUNCHD_LABEL = "com.jonatan.dictation"
+LAUNCHD_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
+
+# The plist sets this in the launchd job's environment. Its presence is how we
+# know the current process was started BY launchd (in the correct GUI session,
+# where the menu-bar icon can draw) rather than by a Finder double-click or a
+# manual run (which run outside that session — hotkey works, but no icon). A
+# manual launch hands off to launchd instead of running headless. See main().
+LAUNCHD_MARKER_ENV = "DICTATION_VIA_LAUNCHD"
 
 # Menu-bar glyphs (SF Symbols, with emoji fallback if unavailable)
 IDLE_SYMBOL = "mic"
@@ -727,10 +735,58 @@ class DictationStatusDelegate(NSObject):
 # Main
 # ---------------------------------------------------------------------------
 
+def relaunch_via_launchd_if_manual() -> None:
+    """If we weren't started by launchd, hand off to launchd and exit.
+
+    A menu-bar app's NSStatusItem only draws for a process in launchd's GUI
+    (Aqua) session. A Finder double-click or a manual `python dictation.py`
+    runs outside it: the global hotkey (a session-independent event tap) still
+    fires, so dictation *works*, but no icon ever appears and there's no UI to
+    Quit or Restart — the app looks broken. Rather than run headless, we route
+    every non-launchd launch back through launchd, so the copy that actually
+    stays running is always the one that can render its icon.
+
+    Detection: the plist stamps LAUNCHD_MARKER_ENV into the job's environment;
+    if it's absent we were launched some other way. `kickstart -k` starts the
+    job (or restarts it fresh if already running — matching the Restart menu
+    item), regardless of the KeepAlive=SuccessfulExit:false policy that keeps a
+    clean Quit quit. Spawned in its own session so it outlives this process.
+    """
+    if os.getenv(LAUNCHD_MARKER_ENV) == "1":
+        return  # started by launchd — the icon can draw; run normally.
+
+    target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    log.info("manual launch detected — handing off to launchd (%s)", target)
+    try:
+        rc = subprocess.call(
+            ["launchctl", "kickstart", "-k", target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if rc != 0 and os.path.exists(LAUNCHD_PLIST):
+            # Job not bootstrapped (e.g. after a bootout) — load it, then kick.
+            log.info("kickstart rc=%d — bootstrapping %s", rc, LAUNCHD_PLIST)
+            subprocess.call(
+                ["launchctl", "bootstrap", f"gui/{os.getuid()}", LAUNCHD_PLIST],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            subprocess.call(
+                ["launchctl", "kickstart", "-k", target],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        notify("Dictation", f"Started — {HOTKEY_DISPLAY} to dictate. Icon's in the menu bar.")
+        sys.exit(0)
+    except Exception:
+        # If the handoff itself fails, fall through and run in-process so a
+        # double-click still gives *some* working dictation (hotkey at least).
+        log.exception("launchd handoff failed — running in-process instead")
+
+
 def main() -> None:
     if not OPENAI_API_KEY or OPENAI_API_KEY == "your-api-key-here":
         log.error("Set your OPENAI_API_KEY in .env")
         sys.exit(1)
+
+    relaunch_via_launchd_if_manual()
 
     if not acquire_single_instance_lock():
         # A duplicate launch is benign (e.g. launchd plus a manual start).
